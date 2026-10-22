@@ -14,7 +14,7 @@
 const { requestWithRetry } = require('./stream');
 const xtream = require('./xtream');   // shared auth, so every endpoint agrees on who may read what
 
-const CACHE_TTL = 30 * 60 * 1000;
+const CACHE_TTL = 3 * 60 * 60 * 1000;
 const cache = new Map();     // sessionId -> { at, body }
 
 function cached(id) {
@@ -65,21 +65,117 @@ async function buildFromPortal(session) {
 
   // Sequential on purpose: this is one request per channel against a line that limits connections.
   // A guide that arrives slowly is much better than one that trips the cap and takes playback down.
-  for (const ch of channels) {
-    let progs = null;
-    try { progs = await session.client.getShortEpg(ch.id); } catch (e) { progs = null; }
-    if (!progs || !progs.length) continue;
+  // Index des chaînes par identifiant Stalker
+  const byPortalId = new Map(
+    channels.map(ch => [String(ch.id), ch])
+  );
+
+  const seen = new Set();
+  let count = 0;
+
+  const asMillis = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0
+      ? (n < 1e12 ? n * 1000 : n)
+      : 0;
+  };
+
+  // Ajouter les programmes au XMLTV
+  const addPrograms = (ch, programs) => {
     const id = ch.epgId || String(ch.streamId);
-    progs.forEach((p) => {
-      const start = xmltvTime(p.startTs);
-      const stop = xmltvTime(p.stopTs);
-      if (!start || !stop) return;
-      out.push('  <programme start="' + start + '" stop="' + stop + '" channel="' + esc(id) + '">');
-      out.push('    <title>' + esc(p.title) + '</title>');
-      if (p.descr) out.push('    <desc>' + esc(p.descr) + '</desc>');
+
+    for (const p of programs) {
+      const start = xmltvTime(asMillis(
+        p.start_timestamp ?? p.start ?? p.startTs
+      ));
+      const stop = xmltvTime(asMillis(
+        p.stop_timestamp ?? p.stop ?? p.stopTs
+      ));
+
+      if (!start || !stop) continue;
+
+      const key = id + '|' + start + '|' + stop;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      out.push(
+        '  <programme start="' + start +
+        '" stop="' + stop +
+        '" channel="' + esc(id) + '">'
+      );
+
+      out.push(
+        '    <title>' + esc(p.name || p.title || '') + '</title>'
+      );
+
+      const desc = p.descr || p.desc || '';
+      if (desc) {
+        out.push('    <desc>' + esc(desc) + '</desc>');
+      }
+
       out.push('  </programme>');
+      count++;
+    }
+  };
+
+  // PRIORITE : recuperation globale de l'EPG
+  try {
+    const r = await session.client._call({
+      type: 'itv',
+      action: 'get_epg_info',
+      period: '24'
     });
+
+    const js = (r && r.js) || {};
+    const data = js.data || js;
+
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      for (const [portalId, programs] of Object.entries(data)) {
+        const ch = byPortalId.get(String(portalId));
+
+        if (ch && Array.isArray(programs)) {
+          addPrograms(ch, programs);
+        }
+      }
+    }
+
+    console.log('[epg] Bulk : ' + count + ' programmes');
+
+  } catch (e) {
+    console.log('[epg] Bulk indisponible : ' + e.message);
   }
+
+  // SECOURS : EPG court pour les chaines belges
+  if (count === 0) {
+    const fallback = channels
+      .filter(ch => /^BE\s*\|/i.test(ch.name || ''))
+      .slice(0, 120);
+
+    console.log('[epg] Repli sur ' + fallback.length + ' chaines BE');
+
+    let index = 0;
+
+    const worker = async () => {
+      while (index < fallback.length) {
+        const ch = fallback[index++];
+
+        try {
+          const programs = await session.client.getShortEpg(ch.id);
+          if (Array.isArray(programs)) {
+            addPrograms(ch, programs);
+          }
+        } catch (e) {
+          // Chaine sans EPG disponible
+        }
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: 4 }, () => worker())
+    );
+  }
+
+  console.log('[epg] XMLTV : ' + count + ' programmes');
   out.push('</tv>');
   return Buffer.from(out.join('\n'), 'utf8');
 }

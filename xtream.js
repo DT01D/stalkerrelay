@@ -96,7 +96,7 @@ function liveItem(ch, catId, num) {
     stream_type: 'live',
     stream_id: ch.streamId,
     stream_icon: ch.logo || '',
-    epg_channel_id: ch.epgId || '',
+    epg_channel_id: ch.epgId || String(ch.streamId),
     added: '0',
     category_id: String(catId || ''),
     custom_sid: '',
@@ -270,12 +270,16 @@ function shortEpgRow(p) {
     epg_id: '',
     title: b64(p.title || ''),
     lang: '',
-    start: p.start || '',
-    end: p.stop || '',
+    start: p.start
+      ? new Date(p.start).toISOString().slice(0, 19).replace('T', ' ')
+      : '',
+    end: p.stop
+      ? new Date(p.stop).toISOString().slice(0, 19).replace('T', ' ')
+      : '',
     description: b64(p.descr || ''),
     channel_id: '',
-    start_timestamp: String(Math.floor((p.startTs || 0) / 1000)),
-    stop_timestamp: String(Math.floor((p.stopTs || 0) / 1000)),
+    start_timestamp: String(Math.floor((p.start || p.startTs || 0) / 1000)),
+    stop_timestamp: String(Math.floor((p.stop || p.stopTs || 0) / 1000)),
   };
 }
 

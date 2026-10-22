@@ -31,12 +31,16 @@ services:
       RELAY_PORT_MIN: "${RELAY_PORT_MIN:-4701}"
       RELAY_PORT_MAX: "${RELAY_PORT_MAX:-4720}"
 
-      RELAY_TZ: "${RELAY_TZ:-Europe/London}"
+      RELAY_TZ: "${RELAY_TZ:-Europe/Brussels}"
 
     volumes:
       # Holds config.json (your lines) and relay-state.json (stream ids). Losing this means
       # re-adding every line, and every saved favourite in every player pointing somewhere new.
       - relay_data:/data
+      - ./stalker.js:/app/stalker.js:ro
+      - ./epg.js:/app/epg.js:ro
+      - ./xtream.js:/app/xtream.js:ro
+      - ./catalog.js:/app/catalog.js:ro
 
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4700/health"]

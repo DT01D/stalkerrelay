@@ -310,7 +310,7 @@ class StalkerClient {
       archive: c.tv_archive_duration || 0,
       epgId: c.xmltv_id || ''
     }));
-    return { items: data, total: parseInt(js.total_items || data.length, 10), perPage: parseInt(js.max_page_items || 14, 10) };
+    return { items: data, total: parseInt(js.total_items, 10) || 0, perPage: parseInt(js.max_page_items || 14, 10) };
   }
 
   _logo(logo) {
@@ -324,7 +324,10 @@ class StalkerClient {
   async getShortEpg(chId) {
     await this.ensureAuth();
     const r = await this._call({ type: 'itv', action: 'get_short_epg', ch_id: String(chId), size: '12' }).catch(() => null);
-    const list = (r && r.js) || [];
+    const js = (r && r.js) || [];
+    const list = Array.isArray(js)
+      ? js
+      : (Array.isArray(js.data) ? js.data : []);
     return list.map(e => ({
       start: (parseInt(e.start_timestamp, 10) || 0) * 1000,
       stop: (parseInt(e.stop_timestamp, 10) || 0) * 1000,
@@ -377,7 +380,21 @@ class StalkerClient {
       category: '0', p: '1', sortby: 'added'
     };
     const r = await this._call(params);
-    return this._vodParse(r);
+const parsed = this._vodParse(r);
+
+const rawItems = Array.isArray(r?.js?.data)
+  ? r.js.data
+  : [];
+
+parsed.items.forEach((item, index) => {
+  const numbers = rawItems[index]?.series;
+
+  if (Array.isArray(numbers)) {
+    item.episodes = numbers;
+  }
+});
+
+return parsed;
   }
 
   _vodParse(r) {
@@ -394,13 +411,14 @@ class StalkerClient {
       poster: m.screenshot_uri ? this._poster(m.screenshot_uri) : (m.poster_url || ''),
       year: m.year,
       rating: m.rating_imdb || m.rating_kinopoisk || '',
+      categoryId: String(m.category_id ?? m.category ?? ''),
       cmd: m.cmd,
       // NB: m.series is an ARRAY of episode numbers and the portal sends [] for plain movies.
       // `!!m.series` was therefore true for everything ([] is truthy in JS), flagging every movie
       // as a series. Require a non-empty array.
       isSeries: String(m.is_series || '0') === '1' || (Array.isArray(m.series) && m.series.length > 0),
     }));
-    return { items: data, total: parseInt(js.total_items || data.length, 10), perPage: parseInt(js.max_page_items || 14, 10) };
+    return { items: data, total: parseInt(js.total_items, 10) || 0, perPage: parseInt(js.max_page_items || 14, 10) };
   }
 
   _poster(uri) {

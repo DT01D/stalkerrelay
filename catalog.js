@@ -34,7 +34,7 @@ const WARM_GAP_MS = 120;
 // How many catalogue pages to fetch at once while the line is idle. The portal serves only
 // ~14 items per page, so a big line is hundreds of pages; fetching several in parallel is the
 // single biggest speed-up. Kept modest — the portal is shared and rate-limited.
-const WARM_CONCURRENCY = 6;
+const WARM_CONCURRENCY = 10;
 
 // How long after connecting before warming starts, so the first device request isn't queued behind
 // a full catalogue walk.

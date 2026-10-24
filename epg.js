@@ -14,7 +14,7 @@
 const { requestWithRetry } = require('./stream');
 const xtream = require('./xtream');   // shared auth, so every endpoint agrees on who may read what
 
-const CACHE_TTL = 3 * 60 * 60 * 1000;
+const CACHE_TTL = 3 * 60 * 1000;
 const cache = new Map();     // sessionId -> { at, body }
 
 function cached(id) {
@@ -118,66 +118,63 @@ async function buildFromPortal(session) {
     }
   };
 
-  // PRIORITE : recuperation globale de l'EPG
+  // BULK EPG : toutes les chaînes, sans fallback
   try {
-    const r = await session.client._call({
+    await session.client.ensureAuth();
+
+    const response = await session.client._call({
       type: 'itv',
       action: 'get_epg_info',
       period: '24'
     });
 
-    const js = (r && r.js) || {};
-    const data = js.data || js;
+    const data = response?.js?.data ?? response?.js ?? {};
 
+    // Format standard : { "channel_id": [programmes] }
     if (data && typeof data === 'object' && !Array.isArray(data)) {
       for (const [portalId, programs] of Object.entries(data)) {
-        const ch = byPortalId.get(String(portalId));
+        const channel = byPortalId.get(String(portalId));
 
-        if (ch && Array.isArray(programs)) {
-          addPrograms(ch, programs);
+        if (channel && Array.isArray(programs)) {
+          addPrograms(channel, programs);
         }
       }
     }
 
-    console.log('[epg] Bulk : ' + count + ' programmes');
+    // Certains portails renvoient un tableau plat.
+    if (Array.isArray(data)) {
+      for (const program of data) {
+        const portalId = String(
+          program.ch_id ?? program.channel_id ?? ''
+        );
 
-  } catch (e) {
-    console.log('[epg] Bulk indisponible : ' + e.message);
-  }
+        const channel = byPortalId.get(portalId);
 
-  // SECOURS : EPG court pour les chaines belges
-  if (count === 0) {
-    const fallback = channels
-      .filter(ch => /^BE\s*\|/i.test(ch.name || ''))
-      .slice(0, 120);
-
-    console.log('[epg] Repli sur ' + fallback.length + ' chaines BE');
-
-    let index = 0;
-
-    const worker = async () => {
-      while (index < fallback.length) {
-        const ch = fallback[index++];
-
-        try {
-          const programs = await session.client.getShortEpg(ch.id);
-          if (Array.isArray(programs)) {
-            addPrograms(ch, programs);
-          }
-        } catch (e) {
-          // Chaine sans EPG disponible
+        if (channel) {
+          addPrograms(channel, [program]);
         }
       }
-    };
+    }
 
-    await Promise.all(
-      Array.from({ length: 4 }, () => worker())
+    console.log(
+      '[epg] Bulk terminé : ' + count + ' programmes'
+    );
+
+  } catch (error) {
+    console.error('[epg] Erreur Bulk :', error.message);
+    throw error;
+  }
+
+  if (count === 0) {
+    throw new Error(
+      'Le portail ne retourne aucun programme via get_epg_info'
     );
   }
 
   console.log('[epg] XMLTV : ' + count + ' programmes');
+
   out.push('</tv>');
-  return Buffer.from(out.join('\n'), 'utf8');
+  return Buffer.from(out.join('\n') + '\n', 'utf8');
 }
 
 async function serve(req, res, url, pool, bound) {
@@ -218,11 +215,21 @@ async function serve(req, res, url, pool, bound) {
     cache.set(session.id, { at: Date.now(), body: body });
     send(body);
   } catch (e) {
-    // An empty but valid guide beats an error: players cope with no programmes, but a 500 makes
-    // some of them drop the playlist entirely.
-    const empty = Buffer.from('<?xml version="1.0" encoding="UTF-8"?>\n<tv/>', 'utf8');
-    try { console.log('[epg] ' + ((e && e.message) || e)); } catch (x) {}
-    send(empty);
+    console.error('[epg] Échec génération :', e.message);
+
+    const previous = cache.get(session.id);
+
+    if (previous?.body) {
+      console.log('[epg] Utilisation du dernier EPG valide');
+      return send(previous.body);
+    }
+
+    const empty = Buffer.from(
+      '<?xml version="1.0" encoding="UTF-8"?>\n<tv/>',
+      'utf8'
+    );
+
+    return send(empty);
   }
 }
 

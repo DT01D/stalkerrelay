@@ -37,7 +37,7 @@ const ui = require('./ui');
 
 // Bump on every change worth verifying in a deploy. Printed at startup so the container log tells
 // you at a glance which build is actually running — no more guessing whether a re-pull took.
-const BUILD = 'hls-deep-buffer 2026-09-02';
+const BUILD = 'vod-range-probe 2026-10-24';
 
 const hls = new HlsManager();
 
@@ -231,19 +231,49 @@ async function resolveStream(session, entry) {
 // stream that is already playing. Cache the resolved link briefly per stream so those repeats reuse
 // one token. Short TTL so a genuinely new play still gets a fresh link.
 const LINK_TTL_MS = 25000;
-const linkCache = new Map();   // key -> { url, at }
-async function resolveCached(session, entry, streamId) {
-  const ep = entry && entry.item && entry.item.seriesEp != null ? entry.item.seriesEp : '';
+const linkCache = new Map();
+const linkInflight = new Map();
+
+async function resolveCached(session, entry, streamId, force = false) {
+  const ep = entry && entry.item && entry.item.seriesEp != null
+    ? entry.item.seriesEp : '';
+
   const key = session.id + '|' + streamId + '|' + ep;
+
+  // Partager une récupération déjà en cours
+  const pending = linkInflight.get(key);
+  if (pending) return pending;
+
   const hit = linkCache.get(key);
-  if (hit && (Date.now() - hit.at) < LINK_TTL_MS) return hit.url;
-  const url = await resolveStream(session, entry);
-  linkCache.set(key, { url: url, at: Date.now() });
-  if (linkCache.size > 512) {   // cheap prune so the map can't grow unbounded
-    const now = Date.now();
-    for (const [k, v] of linkCache) if (now - v.at >= LINK_TTL_MS) linkCache.delete(k);
+
+  if (!force && hit && Date.now() - hit.at < LINK_TTL_MS) {
+    return hit.url;
   }
-  return url;
+
+  const job = resolveStream(session, entry)
+    .then((url) => {
+      linkCache.set(key, {
+        url: url,
+        at: Date.now()
+      });
+
+      if (linkCache.size > 512) {
+        const now = Date.now();
+        for (const [k, v] of linkCache) {
+          if (now - v.at >= LINK_TTL_MS) {
+            linkCache.delete(k);
+          }
+        }
+      }
+
+      return url;
+    })
+    .finally(() => {
+      linkInflight.delete(key);
+    });
+
+  linkInflight.set(key, job);
+  return job;
 }
 
 async function handlePlay(req, res, kind, parts, bound) {
@@ -366,13 +396,40 @@ async function handlePlay(req, res, kind, parts, bound) {
   catch (e) { lease.release(); return text(res, 502, 'could not get a link: ' + ((e && e.message) || e)); }
 
   let released = false;
-  const done = () => { if (!released) { released = true; lease.release(); } };
-  req.on('close', done);
-  res.on('close', done);
-  // Client may have aborted while we awaited the lease/link — don't strand the lease as a ghost.
-  if (req.destroyed || res.destroyed) { done(); return; }
 
-  relayFile(url, headers, req, res);
+const done = () => {
+  if (released) return;
+  released = true;
+  lease.release();
+};
+
+// Ne pas libérer la connexion quand la requête GET
+// est simplement terminée.
+req.on('aborted', done);
+res.on('close', done);
+res.on('error', done);
+
+// Vérifier si le client a réellement quitté la lecture.
+if (req.aborted || res.destroyed || res.writableEnded) {
+  done();
+  return;
+}
+
+log(
+  '[VOD DEBUG] type=' + entry.kind +
+  ' streamId=' + streamId +
+  ' method=' + req.method +
+  ' range=' + (req.headers.range || 'none')
+);
+
+// Lecture Proxy avec renouvellement du lien si nécessaire.
+relayFile(
+  url,
+  headers,
+  req,
+  res,
+  () => resolveCached(session, entry, streamId, true)
+);
 }
 
 // HLS live for mobile: /live/<user>/<pass>/<streamId>/index.m3u8 and .../seg_N.ts. One ffmpeg per

@@ -448,138 +448,470 @@ class LiveRemux {
  * Not shared: two people watching the same film are at different points, and a file has a real
  * offset to resume from, so each gets its own connection.
  */
-function relayFile(target, headers, req, res) {
-  let delivered = 0;
-  let expected = 0;
-  let resumes = 0;
-  let closed = false;
+/**
+ * Proxy VOD / Series avec support HTTP Range.
+ * Reprise au bon offset après interruption.
+ * Renouvellement des liens de lecture expirés.
+ */
+function relayFile(target, headers, req, res, refreshLink) {
+  const clientRange = String(req.headers.range || '').trim();
+  const requested = clientRange
+    ? /^bytes=(\d*)-(\d*)$/i.exec(clientRange)
+    : null;
 
-  // `delivered` counts from zero, but the client's first request may carry a seek (Range: bytes=N-).
-  // The absolute file offset is therefore base + delivered, and a resume MUST ask for that — asking
-  // for bytes=<delivered>- would refetch from N+delivered-worth-of-bytes-too-early and splice the
-  // wrong part of the film into the middle. base is 0 for an unranged play, so this is a no-op there.
-  let base = 0;
-  const rangeStart = /bytes=(\d+)-/i.exec((req.headers && req.headers.range) || '');
-  if (rangeStart) base = parseInt(rangeStart[1], 10) || 0;
+  if (clientRange && (!requested || (!requested[1] && !requested[2]))) {
+    res.writeHead(400);
+    return res.end('Unsupported byte range');
+  }
 
-  // The resolved play link is already authorized by its own play_token. Portal session headers
-  // (Authorization: Bearer, Cookie) don't belong on it, and some panels 403/401/456 the /series/
-  // and /movie/ play endpoints when Authorization is present — the exact reason a real player
-  // sends the bare request. Start with the portal headers (some panels DO want the UA/Referer),
-  // then fall back to a bare fetch once on an auth-shaped rejection.
-  let activeHeaders = headers;
+  const wantedStart = requested && requested[1]
+    ? Number(requested[1]) : null;
+
+  const wantedEnd = requested && requested[1] && requested[2]
+    ? Number(requested[2]) : null;
+
+  const suffixLength = requested && !requested[1]
+    ? Number(requested[2]) : null;
+
+  if (
+    [wantedStart, wantedEnd, suffixLength].some(
+      (n) => n !== null && (!Number.isSafeInteger(n) || n < 0)
+    ) ||
+    (wantedStart !== null &&
+     wantedEnd !== null &&
+     wantedEnd < wantedStart) ||
+    (suffixLength !== null && suffixLength === 0)
+  ) {
+    res.writeHead(416);
+    return res.end();
+  }
+
+  let currentUrl = target;
+  let activeHeaders = Object.assign({}, headers);
   let bareTried = false;
-  const stripAuth = (h) => {
-    // Fully bare, like a plain player: User-Agent (+ Accept) only. Portal Referer/Cookie/Bearer are
-    // what a token-gated /series/ or /movie/ edge rejects; the play_token in the URL is the auth.
-    const c = {};
-    if (h['User-Agent']) c['User-Agent'] = h['User-Agent'];
-    if (h.Accept) c.Accept = h.Accept;
-    return c;
+  let closed = false;
+  let upstream = null;
+  let retryTimer = null;
+  let retries = 0;
+  let firstStart = 0;
+  let bytes = 0;
+  let expected = null;
+  let lastByte = null;
+  let totalSize = null;
+
+  // Fermeture propre de la lecture
+  const stop = () => {
+    closed = true;
+    if (retryTimer) clearTimeout(retryTimer);
+    if (upstream) upstream.destroy();
   };
 
-  req.on('close', () => { closed = true; });
+  req.on('aborted', stop);
+  res.on('close', stop);
 
-  const start = (rangeHeader, first) => {
-    const h = Object.assign({}, activeHeaders);
-    if (rangeHeader) h.Range = rangeHeader;
+  const fail = (message, status = 502) => {
+    if (closed) return;
 
-    requestWithRetry(target, h, {}, (err, up) => {
-      if (closed) { if (up) up.destroy(); return; }
+    log('file: ' + message);
+
+    if (res.headersSent) {
+      res.destroy();
+    } else {
+      res.writeHead(status, {
+        'Content-Type': 'text/plain'
+      });
+      res.end(message);
+    }
+  };
+
+  // Analyse des Content-Range retournés par le CDN
+  const parseContentRange = (value) => {
+    const m = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(
+      String(value || '')
+    );
+
+    if (!m) return null;
+
+    const start = Number(m[1]);
+    const end = Number(m[2]);
+    const total = m[3] === '*' ? null : Number(m[3]);
+
+    if (
+      ![start, end, total].every(
+        (n) => n === null || Number.isSafeInteger(n)
+      ) ||
+      end < start ||
+      (total !== null && (total <= end || total <= 0))
+    ) {
+      return null;
+    }
+
+    return { start, end, total };
+  };
+
+  // Reconnexion progressive au bon offset
+  const retry = (reason, initial) => {
+    if (closed) return;
+
+    if (retries >= RESUME_MAX) {
+      return fail('resume attempts exhausted: ' + reason);
+    }
+
+    retries++;
+
+    const offset = firstStart + bytes;
+
+    if (!initial && lastByte !== null && offset > lastByte) {
+      return res.end();
+    }
+
+    const range = initial
+      ? clientRange
+      : 'bytes=' + offset + '-' + (lastByte ?? '');
+
+    const delay = REOPEN_BACKOFF[
+      Math.min(retries - 1, REOPEN_BACKOFF.length - 1)
+    ];
+
+    log(
+      'file: ' + reason +
+      '; retry ' + retries + '/' + RESUME_MAX +
+      ' at ' + range
+    );
+
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      open(range, initial);
+    }, delay);
+  };
+
+  // Ouverture initiale ou reprise de la source
+  const open = (range, initial, refreshed = false) => {
+    if (closed) return;
+
+    const h = Object.assign({}, activeHeaders, {
+      'Accept-Encoding': 'identity'
+    });
+
+    delete h.Range;
+    if (range) h.Range = range;
+
+    requestWithRetry(currentUrl, h, {}, (err, up) => {
+      if (closed) {
+        if (up) up.destroy();
+        return;
+      }
+
       if (err) {
-        if (!res.headersSent) { res.writeHead(502); res.end('relay: ' + err.message); }
-        else { try { res.destroy(); } catch (e) {} }
-        return;
-      }
-      if (!bareTried && !res.headersSent &&
-          (up.statusCode === 401 || up.statusCode === 403 || up.statusCode === 456) &&
-          (activeHeaders.Authorization || activeHeaders.Cookie)) {
-        // Panel refused the tokenised play link while portal auth headers were attached. Retry bare.
-        bareTried = true;
-        activeHeaders = stripAuth(activeHeaders);
-        up.resume();
-        log('file: ' + up.statusCode + ' with auth headers — retrying bare (play_token only)');
-        return start(rangeHeader, first);
-      }
-      if (up.statusCode >= 400) {
-        let body = '';
-        up.setEncoding('utf8');
-        up.on('data', (c) => { if (body.length < 500) body += c; });
-        up.on('end', () => {
-          if (!res.headersSent) { res.writeHead(up.statusCode); res.end(body); }
-          else { try { res.destroy(); } catch (e) {} }
-        });
-        return;
-      }
-
-      if (first) {
-        expected = parseInt(up.headers['content-length'] || '0', 10) || 0;
-        const out = { 'Accept-Ranges': 'bytes' };
-        ['content-type', 'content-length', 'content-range'].forEach((k) => {
-          if (up.headers[k]) out[k] = up.headers[k];
-        });
-        res.writeHead(up.statusCode, out);
-      }
-
-      up.on('data', (c) => { delivered += c.length; });
-      up.pipe(res, { end: false });
-
-      let done = false;
-      const finish = (why) => {
-        if (done || closed) return;
-        done = true;
-        const complete = expected > 0 && delivered >= expected;
-        if (complete) { try { res.end(); } catch (e) {} return; }
-        if (resumes >= RESUME_MAX) {
-          log('file: giving up at ' + delivered + ' bytes');
-          try { res.destroy(); } catch (e) {}   // destroy, not end: end() reads as success
-          return;
-        }
-        resumes++;
-        log('file: source ' + why + ' at ' + delivered + ' — resuming (' + resumes + '/' + RESUME_MAX + ')');
-        resumeAt(base + delivered);
-      };
-      up.on('end', () => finish('ended'));
-      up.on('aborted', () => finish('aborted'));
-      up.on('error', (e) => finish((e && (e.code || e.message)) || 'error'));
-    });
-  };
-
-  const resumeAt = (offset) => {
-    const want = offset;
-    const h = Object.assign({}, activeHeaders, { Range: 'bytes=' + want + '-' });
-    requestWithRetry(target, h, {}, (err, up) => {
-      if (closed) { if (up) up.destroy(); return; }
-      // Only a 206 from exactly where we stopped can be appended. A 200 means the server ignored
-      // Range and is starting over, which would splice the beginning into the middle of the film.
-      const cr = (up && up.headers['content-range']) || '';
-      const m = /bytes\s+(\d+)-/i.exec(cr);
-      const ok = !err && up && up.statusCode === 206 && m && parseInt(m[1], 10) === want;
-      if (!ok) {
-        log('file: source will not resume (HTTP ' + (up && up.statusCode) + ')');
         if (up) up.resume();
-        try { res.destroy(); } catch (e) {}
-        return;
+        return retry(
+          err.message || 'upstream request failed',
+          initial
+        );
       }
-      up.on('data', (c) => { delivered += c.length; });
-      up.pipe(res, { end: false });
+
+      const status = up.statusCode;
+
+      log(
+        'file: upstream HTTP ' + status +
+        ' | range=' + (range || 'none') +
+        ' | content-range=' +
+          (up.headers['content-range'] || 'none') +
+        ' | content-length=' +
+          (up.headers['content-length'] || 'unknown')
+      );
+
+      // Réessayer sans les headers d'authentification
+      // du portail si le lien est déjà autorisé.
+      if (
+        !bareTried &&
+        [401, 403, 456].includes(status) &&
+        (activeHeaders.Authorization || activeHeaders.Cookie)
+      ) {
+        bareTried = true;
+
+        const bare = {};
+
+        if (activeHeaders['User-Agent']) {
+          bare['User-Agent'] = activeHeaders['User-Agent'];
+        }
+
+        if (activeHeaders.Accept) {
+          bare.Accept = activeHeaders.Accept;
+        }
+
+        activeHeaders = bare;
+        up.resume();
+
+        return open(range, initial, refreshed);
+      }
+
+      // Renouvellement du play_token si le lien a expiré
+      if (
+        [401, 403, 410, 456].includes(status) &&
+        refreshLink &&
+        !refreshed
+      ) {
+        up.resume();
+
+        return Promise.resolve()
+          .then(refreshLink)
+          .then((url) => {
+            if (closed) return;
+
+            if (!url) {
+              throw new Error('portal returned an empty link');
+            }
+
+            currentUrl = url;
+            open(range, initial, true);
+          })
+          .catch((e) => {
+            retry('cannot renew link: ' + e.message, initial);
+          });
+      }
+
+      // Range non satisfaisable
+      if (initial && status === 416) {
+        const extra = {};
+
+        if (up.headers['content-range']) {
+          extra['Content-Range'] = up.headers['content-range'];
+        }
+
+        res.writeHead(416, extra);
+        up.resume();
+
+        return res.end();
+      }
+
+      if (status !== 200 && status !== 206) {
+        up.resume();
+
+        return fail(
+          'upstream HTTP ' + status,
+          initial ? status : 502
+        );
+      }
+
+      const part = status === 206
+        ? parseContentRange(up.headers['content-range'])
+        : null;
+
+      if (status === 206 && !part) {
+        up.resume();
+        return fail('invalid Content-Range from upstream');
+      }
+
+      const lengthText = up.headers['content-length'];
+
+      const length = lengthText !== undefined &&
+        /^\d+$/.test(String(lengthText))
+        ? Number(lengthText)
+        : null;
+
+      if (
+        length !== null &&
+        !Number.isSafeInteger(length)
+      ) {
+        up.resume();
+        return fail('invalid Content-Length from upstream');
+      }
+
+      if (
+        part &&
+        length !== null &&
+        length !== part.end - part.start + 1
+      ) {
+        up.resume();
+        return fail('inconsistent Content-Length / Content-Range');
+      }
+
+      // Première réponse envoyée au lecteur IPTV
+      if (initial) {
+        if (
+          clientRange &&
+          status !== 206 &&
+          !(wantedStart === 0 && wantedEnd === null)
+        ) {
+          up.resume();
+          return fail('upstream ignored byte-range request');
+        }
+
+        if (part) {
+          if (
+            (wantedStart !== null &&
+             part.start !== wantedStart) ||
+            (wantedEnd !== null &&
+             part.end > wantedEnd) ||
+            (suffixLength !== null &&
+             (part.total === null ||
+              part.start !== Math.max(
+                0, part.total - suffixLength
+              ))) ||
+            (!clientRange && part.start !== 0)
+          ) {
+            up.resume();
+            return fail('upstream returned a different byte range');
+          }
+
+          firstStart = part.start;
+          totalSize = part.total;
+
+          // Calculer la fin réelle du fichier ou de la plage demandée,
+          // même si le CDN renvoie seulement une portion des octets.
+          lastByte = part.total !== null
+            ? Math.min(wantedEnd ?? part.total - 1, part.total - 1)
+            : (wantedEnd ?? part.end);
+
+          expected = lastByte - firstStart + 1;
+
+        } else {
+          firstStart = 0;
+          totalSize = length;
+          expected = length;
+          lastByte = length !== null
+            ? length - 1
+            : null;
+        }
+
+        const out = {
+          'Cache-Control': 'no-store'
+        };
+
+        for (const key of [
+          'content-type',
+          'content-length',
+          'content-range'
+        ]) {
+          if (up.headers[key] !== undefined) {
+            out[key] = up.headers[key];
+          }
+        }
+
+        if (part) {
+          out['Accept-Ranges'] = 'bytes';
+
+          delete out['content-length'];
+          delete out['content-range'];
+
+          if (!clientRange) {
+            // Le lecteur n'a pas demandé de plage.
+            // On lui annonce la taille totale du film.
+            if (part.total !== null) {
+              out['Content-Length'] = String(part.total);
+            }
+          } else {
+            // Le lecteur a demandé une plage.
+            // On annonce la totalité de la plage à transmettre,
+            // y compris si plusieurs requêtes CDN sont nécessaires.
+            out['Content-Range'] =
+              'bytes ' + firstStart + '-' + lastByte +
+              '/' + (totalSize ?? '*');
+
+            out['Content-Length'] = String(expected);
+          }
+
+        } else if (up.headers['accept-ranges']) {
+          out['Accept-Ranges'] =
+            up.headers['accept-ranges'];
+        }
+
+        res.writeHead(
+          !clientRange && part ? 200 : status,
+          out
+        );
+
+      } else {
+        // Vérification stricte de l'offset de reprise
+        const want = firstStart + bytes;
+
+        if (
+          status !== 206 ||
+          !part ||
+          part.start !== want ||
+          (lastByte !== null && part.end > lastByte) ||
+          (totalSize !== null &&
+           part.total !== null &&
+           part.total !== totalSize)
+        ) {
+          up.resume();
+
+          return fail(
+            'cannot resume at byte ' + want +
+            ' (HTTP ' + status + ')'
+          );
+        }
+      }
+
+      upstream = up;
+
+      const segmentStartBytes = bytes;
       let done = false;
-      const finish = (why) => {
+
+      up.on('data', (chunk) => {
+        bytes += chunk.length;
+      });
+
+      up.pipe(res, { end: false });
+
+      const finish = (why, normalEnd) => {
         if (done || closed) return;
+
         done = true;
-        if (expected > 0 && delivered >= expected) { try { res.end(); } catch (e) {} return; }
-        if (resumes >= RESUME_MAX) { try { res.destroy(); } catch (e) {} return; }
-        resumes++;
-        log('file: source ' + why + ' at ' + delivered + ' — resuming (' + resumes + '/' + RESUME_MAX + ')');
-        resumeAt(base + delivered);
+        up.unpipe(res);
+
+        if (upstream === up) {
+          upstream = null;
+        }
+
+        // La totalité de la plage demandée a été transmise
+        if (expected !== null && bytes >= expected) {
+          return res.end();
+        }
+
+        // Flux sans longueur connue, terminé normalement
+        if (normalEnd && expected === null) {
+          return res.end();
+        }
+
+        // Réinitialiser les tentatives après une lecture saine
+        if (bytes - segmentStartBytes >= 4 * 1024 * 1024) {
+          retries = 0;
+        }
+
+        retry(
+          'upstream ' + why +
+          ' at byte ' + (firstStart + bytes),
+          false
+        );
       };
-      up.on('end', () => finish('ended'));
-      up.on('aborted', () => finish('aborted'));
-      up.on('error', (e) => finish((e && (e.code || e.message)) || 'error'));
+
+      up.once('end', () => {
+        finish('ended', true);
+      });
+
+      up.once('aborted', () => {
+        finish('aborted', false);
+      });
+
+      up.once('error', (e) => {
+        finish(e.message || 'error', false);
+      });
+
+      up.once('close', () => {
+        if (!up.complete) {
+          finish('closed', false);
+        }
+      });
     });
   };
 
-  start(req.headers && req.headers.range, true);
+  // Démarrage de la lecture
+  // Si le lecteur ne fournit aucun Range, demander
+  // bytes=0- pour obtenir la taille et les métadonnées
+  // permettant la navigation dans le film.
+  open(clientRange || 'bytes=0-', true);
 }
 
 /** A per-viewer stream fed by a Broadcast. */

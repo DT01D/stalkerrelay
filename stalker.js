@@ -447,7 +447,7 @@ return parsed;
     // call blanks the stream and mints a new token that invalidates the original one (-> 456).
     // The working reference clients just take this URL and swap ts->m3u8, so do the same.
     if (cmdComplete) {
-      try { console.log('[createLink]', type, '| via: cmd-direct | url:', JSON.stringify(cmdUrl)); } catch (e) {}
+      console.log('[createLink]', type, '| via: cmd-direct');
       return { url: cmdUrl, raw: cmd, candidates: [cmdUrl] };
     }
 
@@ -483,7 +483,12 @@ return parsed;
     pushCand(clWithStream);              // create_link fresh-token variant
     if (!candidates.length && url) candidates.push(url);
 
-    try { console.log('[createLink]', type, '| via:', source, '| sent cmd:', JSON.stringify(sendCmd), '| portal returned:', JSON.stringify(link), '| candidates:', JSON.stringify(candidates)); } catch (e) {}
+    console.log(
+      '[createLink]',
+      'type=' + type,
+      'source=' + source,
+      'candidates=' + candidates.length
+    );
     if (!candidates.length) throw new Error('Portal returned no stream link (channel/movie may be unavailable).');
     return { url: candidates[0], raw: link, candidates: candidates };
   }

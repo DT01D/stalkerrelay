@@ -47,12 +47,15 @@ function sessionFor(pool, bound, user) {
 function logDenial(pool, bound, user, where) {
   try {
     if (!bound && !pool.byMac(user)) {
-      const known = pool.list().map((s) => s.cfg.mac).filter(Boolean);
-      console.log('[relay] ' + where + ': refused username "' + user + '" — no line has that MAC. ' +
-        (known.length ? 'Configured: ' + known.join(', ') : 'No lines are configured.'));
+      console.log(
+        '[relay] ' + where +
+        ': authentication refused (unknown line)'
+      );
     } else {
-      console.log('[relay] ' + where + ': refused — wrong password for "' +
-        ((bound && bound.name) || user) + '"');
+      console.log(
+        '[relay] ' + where +
+        ': authentication refused (invalid password)'
+      );
     }
   } catch (e) {}
 }
@@ -336,7 +339,7 @@ async function playlist(req, res, url, pool, bound) {
     '&password=' + encodeURIComponent(password) + '"'];
   channels.forEach((ch) => {
     const group = catsById[String(ch.genreId)] || 'Other';
-    lines.push('#EXTINF:-1 tvg-id="' + (ch.epgId || '') + '" tvg-name="' + esc(ch.name) +
+    lines.push('#EXTINF:-1 tvg-id="' + (ch.epgId || String(ch.streamId)) + '" tvg-name="' + esc(ch.name) +
       '" tvg-logo="' + (ch.logo || '') + '" group-title="' + esc(group) + '",' + (ch.name || ''));
     lines.push(playUrl(base, user, password, 'live', ch.streamId, 'ts'));
   });

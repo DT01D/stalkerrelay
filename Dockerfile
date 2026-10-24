@@ -1,5 +1,5 @@
 # Dependency-free Node — there is no npm install step, so the image builds offline and in seconds.
-FROM node:20-alpine
+FROM node:24-alpine
 
 # ffmpeg is optional; it is only used to remux awkward containers. Without it the relay still
 # streams everything the provider serves directly.

@@ -14,8 +14,9 @@
 const { requestWithRetry } = require('./stream');
 const xtream = require('./xtream');   // shared auth, so every endpoint agrees on who may read what
 
-const CACHE_TTL = 3 * 60 * 1000;
+const CACHE_TTL = 3 * 60 * 60 * 1000;
 const cache = new Map();     // sessionId -> { at, body }
+const inflight = new Map();  // sessionId -> Promise
 
 function cached(id) {
   const hit = cache.get(id);
@@ -51,7 +52,7 @@ function fetchUrl(url) {
   });
 }
 
-/** Assemble a guide from the portal's per-channel short EPG. */
+/** Build XMLTV using the portal's bulk EPG response. */
 async function buildFromPortal(session) {
   const channels = await session.catalog.liveChannels();
   const out = ['<?xml version="1.0" encoding="UTF-8"?>',
@@ -201,29 +202,64 @@ async function serve(req, res, url, pool, bound) {
   const hit = cached(session.id);
   if (hit) return send(hit);
 
+  // Réutiliser une génération EPG déjà en cours.
+  let job = inflight.get(session.id);
+
+  if (!job) {
+    job = (async () => {
+      await session.ensure();
+
+      const external = (session.cfg.epgUrl || '').trim() ||
+        (session.client.getEpgUrl
+          ? session.client.getEpgUrl()
+          : '');
+
+      const body = external
+        ? await fetchUrl(external)
+        : await buildFromPortal(session);
+
+      // Stocker uniquement une génération réussie.
+      cache.set(session.id, {
+        at: Date.now(),
+        body: body
+      });
+
+      return body;
+    })();
+
+    inflight.set(session.id, job);
+
+    // Libérer la promesse, réussite ou échec.
+    const cleanup = () => {
+      if (inflight.get(session.id) === job) {
+        inflight.delete(session.id);
+      }
+    };
+
+    job.then(cleanup, cleanup);
+  }
+
   try {
-    await session.ensure();
-    const external = (session.cfg.epgUrl || '').trim() ||
-      (session.client.getEpgUrl ? session.client.getEpgUrl() : '');
+    return send(await job);
 
-    let body;
-    if (external) {
-      body = await fetchUrl(external);
-    } else {
-      body = await buildFromPortal(session);
-    }
-    cache.set(session.id, { at: Date.now(), body: body });
-    send(body);
   } catch (e) {
-    console.error('[epg] Échec génération :', e.message);
+    console.error(
+      '[epg] Échec génération :',
+      e.message
+    );
 
+    // Conserver le dernier guide valide.
     const previous = cache.get(session.id);
 
     if (previous?.body) {
-      console.log('[epg] Utilisation du dernier EPG valide');
+      console.log(
+        '[epg] Utilisation du dernier EPG valide'
+      );
+
       return send(previous.body);
     }
 
+    // Aucun guide disponible : XMLTV vide mais valide.
     const empty = Buffer.from(
       '<?xml version="1.0" encoding="UTF-8"?>\n<tv/>',
       'utf8'

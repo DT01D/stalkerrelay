@@ -62,7 +62,7 @@ function isTlsError(e) {
 }
 
 function tlsOpts(u, mode) {
-  const o = { servername: u.hostname, rejectUnauthorized: false };
+  const o = { servername: u.hostname, rejectUnauthorized: true };
   if (mode === 'legacy') {
     o.minVersion = 'TLSv1';
     o.ciphers = 'DEFAULT@SECLEVEL=0';
@@ -188,7 +188,7 @@ class Broadcast {
           return;
         }
         this.contentType = res.headers['content-type'] || this.contentType;
-        if (finalUrl && finalUrl !== this.target) { this.edgeTarget = finalUrl; log('resolved edge: ' + finalUrl.slice(0, 90)); }
+        if (finalUrl && finalUrl !== this.target) { this.edgeTarget = finalUrl; log('resolved edge (HTTP redirect followed)'); }
         this._attachUpstream(res);
         resolve(this);
       });

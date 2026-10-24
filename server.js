@@ -37,7 +37,7 @@ const ui = require('./ui');
 
 // Bump on every change worth verifying in a deploy. Printed at startup so the container log tells
 // you at a glance which build is actually running — no more guessing whether a re-pull took.
-const BUILD = 'vod-range-probe 2026-10-24';
+const BUILD = 'core-hardening 2026-10-24';
 
 const hls = new HlsManager();
 
@@ -309,7 +309,7 @@ async function handlePlay(req, res, kind, parts, bound) {
     let url;
     try { url = await resolveCached(session, entry, streamId); }
     catch (e) { return text(res, 502, 'could not get a link: ' + ((e && e.message) || e)); }
-    log('redirect ' + entry.kind + ' #' + streamId + ' -> ' + url);
+    log('redirect ' + entry.kind + ' #' + streamId);
     res.writeHead(302, { Location: url, 'Cache-Control': 'no-cache' });
     return res.end();
   }
@@ -344,7 +344,7 @@ async function handlePlay(req, res, kind, parts, bound) {
     // The client can vanish WHILE we awaited the lease/create_link (the edge-swap churn makes players
     // reconnect constantly). If it already left, adding a viewer now would leak — the close event has
     // already passed, so its handler would never fire. Release and bail instead of stranding a ghost.
-    if (req.destroyed || res.destroyed || res.writableEnded) { lease.release(); return; }
+    if (req.aborted || res.destroyed || res.writableEnded) { lease.release(); return; }
 
     const v = viewerStream();
     broadcast.addViewer(v);
@@ -362,11 +362,11 @@ async function handlePlay(req, res, kind, parts, bound) {
       broadcast.removeViewer(v);
       lease.release();
     };
-    req.on('close', done);
+    req.on('aborted', done);
     res.on('close', done);
     res.on('error', done);
     // One more check: the close may have fired between addViewer and attaching the handler above.
-    if (req.destroyed || res.destroyed) done();
+    if (req.aborted || res.destroyed || res.writableEnded) done();
     return;
   }
 
